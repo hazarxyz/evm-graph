@@ -8,7 +8,7 @@ The initial implementation selects a 2% project allocation and an additional 0.3
 
 ## Build
 
-Use Foundry 1.8.0 and Solidity 0.8.26+commit.8a97fa7a. Dependencies are vendored as source; their selected revisions are recorded in `foundry.lock`. Exact exported file digests are in `source-manifest.json`. Each dependency retains its license files and individual SPDX declarations.
+Use Foundry 1.8.0. The initial graph, `NeutralBudgetHook` and `NeutralVoucherHook` use Solidity 0.8.26+commit.8a97fa7a; `NeutralFlowHook` uses Solidity 0.8.27+commit.40a35a09. Select the recorded compiler explicitly when reproducing an implementation. Dependencies are vendored as source; their selected revisions are recorded in `foundry.lock`. Exact exported file digests are in `source-manifest.json`. Each dependency retains its license files and individual SPDX declarations.
 
 ```sh
 forge build --use 0.8.26
@@ -33,9 +33,9 @@ The project-rate and waiver storage namespaces survive replacement. Old earned c
 Exact remappings are pinned in `foundry.toml`; automatic discovery is disabled to keep compiler metadata reproducible. The three selected release fork suites passed at blocks 26113926, 26113950 and 26113996 respectively. Use a fresh explicit Ethereum block when evaluating current state:
 
 ```sh
-ETHEREUM_FORK_BLOCK=26113996 forge test --use 0.8.26 --match-contract NeutralBudgetForkTest
-ETHEREUM_FORK_BLOCK=26113996 forge test --use 0.8.26 --match-contract NeutralVoucherForkTest
-ETHEREUM_FORK_BLOCK=26113996 forge test --use 0.8.26 --match-contract NeutralFlowForkTest
+ETHEREUM_RPC_URL=https://ethereum-rpc.publicnode.com ETHEREUM_FORK_BLOCK=26113926 forge test --use 0.8.26 --match-contract NeutralBudgetForkTest
+ETHEREUM_RPC_URL=https://ethereum-rpc.publicnode.com ETHEREUM_FORK_BLOCK=26113950 forge test --use 0.8.26 --match-contract NeutralVoucherForkTest
+ETHEREUM_RPC_URL=https://ethereum-rpc.publicnode.com ETHEREUM_FORK_BLOCK=26113996 forge test --use 0.8.27 --match-contract NeutralFlowForkTest
 ```
 
 Fork evidence and verified source do not prove that every future implementation will be safe, indexed, routable or compatible with every interface
