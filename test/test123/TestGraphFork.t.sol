@@ -29,6 +29,7 @@ import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionMa
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 
 contract TestReplacementProbe is TestHookBase {
@@ -47,6 +48,34 @@ contract TestReplacementProbe is TestHookBase {
     }
     function afterAddLiquidity(address,PoolKey calldata,ModifyLiquidityParams calldata,BalanceDelta,BalanceDelta,bytes calldata) external override onlyPoolManager returns(bytes4,BalanceDelta) {
         return(IHooks.afterAddLiquidity.selector,toBalanceDelta(5,6));
+    }
+}
+
+
+/// @dev Funded independent ERC-6909 caller. No vault approval or operator privilege is used.
+contract TestClaimSender is IUnlockCallback {
+    IPoolManager immutable manager;
+    constructor(IPoolManager m) {manager=m;}
+    function credit(address recipient) external payable {manager.unlock(abi.encode(recipient,msg.value));}
+    function transferCredit(address recipient,uint256 amount) external {require(manager.transfer(recipient,0,amount));}
+    function unlockCallback(bytes calldata data) external returns(bytes memory) {
+        require(msg.sender==address(manager));
+        (address recipient,uint256 amount)=abi.decode(data,(address,uint256));
+        manager.sync(Currency.wrap(address(0)));
+        assert(manager.settle{value:amount}()==amount);
+        manager.mint(recipient,0,amount);
+        return "";
+    }
+}
+/// @dev Minimal old equality rule, reproduced with actual funded PoolManager claims, not a ledger mock.
+contract TestOldEqualityProbe {
+    IPoolManager immutable manager;
+    uint256 public recorded;
+    error UnassignedCreditBlocksAllocation();
+    constructor(IPoolManager m) {manager=m;}
+    function record(uint256 amount) external {
+        if(manager.balanceOf(address(this),0)!=recorded+amount) revert UnassignedCreditBlocksAllocation();
+        recorded+=amount;
     }
 }
 
@@ -293,4 +322,81 @@ contract TestGraphFork is Test {
         assertFalse(IPoolManager(MANAGER).isOperator(outputs[0],outputs[5]));assertEq(IPoolManager(MANAGER).allowance(outputs[0],outputs[5],0),0);
         project().claimActive(a);(,tt)=project().balances();assertEq(tt,t);project().claimTreasury(t);platform().claimCanonical(platform().canonicalPlatformBalance());platform().claimAdditional(platform().additionalPlatformBalance());
     }
+
+    function _fourModes() internal {
+        _swap(true,false,0.001 ether,1,0.001 ether);
+        _swap(false,false,10 ether,1,0);
+        _exactOutput(true,1 ether);_exactOutput(false,0.00001 ether);
+    }
+    function test_realManagerOldEqualityRuleOneWeiGriefReproduced() public {
+        TestOldEqualityProbe old=new TestOldEqualityProbe(IPoolManager(MANAGER));
+        TestClaimSender donor=new TestClaimSender(IPoolManager(MANAGER));
+        address outsider=address(0xBEEF);vm.deal(outsider,4);
+        vm.prank(outsider);donor.credit{value:1}(address(old));
+        vm.prank(outsider);donor.credit{value:3}(address(old));
+        assertEq(IPoolManager(MANAGER).balanceOf(address(old),0),4);
+        vm.expectRevert(TestOldEqualityProbe.UnassignedCreditBlocksAllocation.selector);old.record(3);
+        assertEq(old.recorded(),0);
+    }
+    function test_unsolicitedRealClaimsMintAndTransferCannotBrickFourModes() public {
+        _launchMocked();_approveRouter();
+        TestClaimSender donor=new TestClaimSender(IPoolManager(MANAGER));
+        address outsider=address(0xBEEF);vm.deal(outsider,2);
+        vm.prank(outsider);donor.credit{value:1}(address(platform()));
+        assertEq(platform().unassignedBalance(),1);_fourModes();
+        vm.prank(outsider);donor.credit{value:1}(address(donor));
+        vm.prank(outsider);donor.transferCredit(address(platform()),1);
+        assertEq(platform().unassignedBalance(),2);_fourModes();
+        uint256 c=platform().canonicalPlatformBalance();uint256 e=platform().additionalPlatformBalance();
+        assertEq(platform().balance(),c+e+2);
+        vm.expectRevert(TestPlatformRevenue.NotHook.selector);vm.prank(outsider);platform().recordAllocation(1,0);
+        vm.expectRevert(TestPlatformRevenue.InvalidConfiguration.selector);vm.prank(outputs[5]);platform().recordAllocation(3,0);
+        assertEq(platform().canonicalPlatformBalance(),c);assertEq(platform().additionalPlatformBalance(),e);
+        assertFalse(IPoolManager(MANAGER).isOperator(address(platform()),outsider));
+        assertFalse(IPoolManager(MANAGER).isOperator(address(platform()),outputs[5]));
+        assertEq(IPoolManager(MANAGER).allowance(address(platform()),outsider,0),0);
+        assertEq(IPoolManager(MANAGER).allowance(address(platform()),outputs[5],0),0);
+        uint256 beforePayout=PLATFORM.balance;
+        vm.prank(outsider);platform().claimUnassigned(2);
+        assertEq(platform().canonicalPlatformBalance(),c);assertEq(platform().additionalPlatformBalance(),e);
+        platform().claimCanonical(c);platform().claimAdditional(e);
+        assertEq(PLATFORM.balance,beforePayout+c+e+2);assertEq(platform().balance(),0);
+        _fourModes();assertEq(platform().unassignedBalance(),0);
+    }
+    function _decrease(uint256 amount,address who) internal {
+        bytes[] memory p=new bytes[](2);
+        p[0]=abi.encode(boot().positionId(),amount,uint128(0),uint128(0),bytes(""));
+        p[1]=abi.encode(key.currency0,key.currency1,AGENT);
+        bytes memory actions=abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY),uint8(Actions.TAKE_PAIR));
+        bytes memory callData=abi.encode(actions,p);
+        if(who!=AGENT) vm.expectRevert();
+        vm.prank(who);IPositionManager(POSM).modifyLiquidities(callData,block.timestamp);
+    }
+    function test_officialPositionManagerOwnerExitWithoutVaultOrAdminChanges() public {
+        _launchMocked();uint256 id=boot().positionId();uint128 l=IPositionManager(POSM).getPositionLiquidity(id);
+        (uint256 a,uint256 t)=project().balances();uint256 c=platform().canonicalPlatformBalance();uint256 e=platform().additionalPlatformBalance();
+        _decrease(l/4,address(0xBAD));
+        uint256 ethBefore=AGENT.balance;uint256 tokensBefore=token().balanceOf(AGENT);
+        _decrease(l/4,AGENT);
+        assertEq(IPositionManager(POSM).getPositionLiquidity(id),l-l/4);assertEq(IERC721(POSM).ownerOf(id),AGENT);
+        assertGt(AGENT.balance,ethBefore);assertGt(token().balanceOf(AGENT),tokensBefore);
+        (uint256 aa,uint256 tt)=project().balances();assertEq(aa,a);assertEq(tt,t);
+        assertEq(platform().canonicalPlatformBalance(),c);assertEq(platform().additionalPlatformBalance(),e);
+        assertEq(ProxyAdmin(boot().originalTokenAdmin()).owner(),AGENT);assertEq(ProxyAdmin(boot().originalHookAdmin()).owner(),AGENT);
+        _approveRouter();_fourModes();
+    }
+    function test_nativePartialAndUnfilledExactOutputRollBackEverything() public {
+        _launchMocked();_approveRouter();
+        (uint256 a,uint256 t)=project().balances();uint256 f=platform().balance();uint256 tokensBefore=token().balanceOf(AGENT);
+        (uint160 priceBefore,,,)=IPoolManager(MANAGER).getSlot0(key.toId());
+        vm.expectRevert();_swap(false,true,1 ether,type(uint128).max,0);
+        vm.deal(AGENT,1e31); // Synthetic exhaustion capital, never launch funding.
+        vm.expectRevert();_swap(true,false,uint128(1e30),1,1e30);
+        vm.expectRevert();_swap(true,true,uint128(2e27),uint128(1e30),1e30);
+        (uint256 aa,uint256 tt)=project().balances();assertEq(aa,a);assertEq(tt,t);assertEq(platform().balance(),f);
+        assertEq(token().balanceOf(AGENT),tokensBefore);
+        (uint160 priceAfter,,,)=IPoolManager(MANAGER).getSlot0(key.toId());assertEq(priceAfter,priceBefore);
+        assertEq(SWAP_ROUTER.balance,0);_fourModes();
+    }
+
 }

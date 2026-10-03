@@ -1,5 +1,4 @@
 {
-  "schemaVersion": "neutral-source-manifest.v1",
   "files": [
     {
       "path": "src/test123/TestBootstrap.sol",
@@ -43,7 +42,7 @@
     },
     {
       "path": "test/test123/TestGraphFork.t.sol",
-      "sha256": "cdce57a1620a2acf11908732a57196a1cfdcf9ad0729572a03f8e236b67be403"
+      "sha256": "333cdec8294dcf90d47055b374b8730530131e5e8171f14521dfefa55f357c7b"
     },
     {
       "path": "test/test123/TestUnit.t.sol",
