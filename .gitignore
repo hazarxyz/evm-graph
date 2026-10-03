@@ -1,0 +1,7 @@
+out/
+cache/
+broadcast/
+evidence/
+.research/
+.env
+.env.*
