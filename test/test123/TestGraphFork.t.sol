@@ -21,6 +21,9 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SwapParams,ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta,toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -385,18 +388,46 @@ contract TestGraphFork is Test {
         assertEq(ProxyAdmin(boot().originalTokenAdmin()).owner(),AGENT);assertEq(ProxyAdmin(boot().originalHookAdmin()).owner(),AGENT);
         _approveRouter();_fourModes();
     }
+    // This is the official core test helper, not a production router or new route.
+    // Bound the price one tick away so cold archive RPC does not scan empty ranges.
+    function _poolState() internal view returns(bytes32) {
+        (uint160 price,int24 tick,uint24 protocolFee,uint24 lpFee)=IPoolManager(MANAGER).getSlot0(key.toId());
+        return keccak256(abi.encode(price,tick,protocolFee,lpFee,
+            IPositionManager(POSM).getPositionLiquidity(boot().positionId())));
+    }
+    function _claimState() internal view returns(bytes32) {
+        (uint256 a,uint256 t)=project().balances();
+        return keccak256(abi.encode(a,t,platform().canonicalPlatformBalance(),platform().additionalPlatformBalance(),
+            platform().balance(),IPoolManager(MANAGER).balanceOf(outputs[0],0)));
+    }
+    function _rollbackState(PoolSwapTest helper) internal view returns(bytes32) {
+        bytes32 balances=keccak256(abi.encode(AGENT.balance,token().balanceOf(AGENT),
+            MANAGER.balance,token().balanceOf(MANAGER),address(helper).balance,
+            token().balanceOf(address(helper)),SWAP_ROUTER.balance));
+        return keccak256(abi.encode(_claimState(),_poolState(),balances));
+    }
+    function _boundedNativeRevert(PoolSwapTest helper,bool exactInput) internal {
+        (,int24 tick,,)=IPoolManager(MANAGER).getSlot0(key.toId());
+        SwapParams memory params=SwapParams(exactInput,exactInput?-int256(0.001 ether):int256(0.001 ether),
+            TickMath.getSqrtPriceAtTick(exactInput?tick-1:tick+1));
+        bytes memory expected=abi.encodeWithSelector(CustomRevert.WrappedError.selector,outputs[5],IHooks.afterSwap.selector,
+            abi.encodeWithSelector(TestInitialHook.PartialNativeFill.selector),abi.encodeWithSelector(Hooks.HookCallFailed.selector));
+        bytes32 beforeState=_rollbackState(helper);
+        vm.expectRevert(expected);
+        vm.prank(AGENT);
+        helper.swap{value:exactInput?0.001 ether:0}(key,params,PoolSwapTest.TestSettings(false,false),bytes(""));
+        assertEq(_rollbackState(helper),beforeState,"partial native swap must revert every balance, claim and pool update");
+    }
     function test_nativePartialAndUnfilledExactOutputRollBackEverything() public {
         _launchMocked();_approveRouter();
-        (uint256 a,uint256 t)=project().balances();uint256 f=platform().balance();uint256 tokensBefore=token().balanceOf(AGENT);
-        (uint160 priceBefore,,,)=IPoolManager(MANAGER).getSlot0(key.toId());
-        vm.expectRevert();_swap(false,true,1 ether,type(uint128).max,0);
-        vm.deal(AGENT,1e31); // Synthetic exhaustion capital, never launch funding.
-        vm.expectRevert();_swap(true,false,uint128(1e30),1,1e30);
-        vm.expectRevert();_swap(true,true,uint128(2e27),uint128(1e30),1e30);
-        (uint256 aa,uint256 tt)=project().balances();assertEq(aa,a);assertEq(tt,t);assertEq(platform().balance(),f);
-        assertEq(token().balanceOf(AGENT),tokensBefore);
-        (uint160 priceAfter,,,)=IPoolManager(MANAGER).getSlot0(key.toId());assertEq(priceAfter,priceBefore);
-        assertEq(SWAP_ROUTER.balance,0);_fourModes();
+        PoolSwapTest helper=new PoolSwapTest(IPoolManager(MANAGER));
+        vm.prank(AGENT);token().approve(address(helper),type(uint256).max);
+        uint256 helperEthBefore=address(helper).balance;
+        uint256 routerEthBefore=SWAP_ROUTER.balance;
+        _boundedNativeRevert(helper,true);
+        _boundedNativeRevert(helper,false);
+        assertEq(address(helper).balance,helperEthBefore);assertEq(SWAP_ROUTER.balance,routerEthBefore);
+        _fourModes();
     }
 
 }
